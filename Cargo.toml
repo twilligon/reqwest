@@ -204,6 +204,7 @@ features = [
 [target.'cfg(all(target_arch = "wasm32", any(target_os = "unknown", target_os = "none")))'.dev-dependencies]
 wasm-bindgen = { version = "0.2.89", features = ["serde-serialize"] }
 wasm-bindgen-test = "0.3"
+futures-util = { version = "0.3.28", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 tower = { version = "0.5.2", default-features = false, features = ["limit"] }
@@ -285,3 +286,16 @@ required-features = ["deflate", "stream"]
 name = "multipart"
 path = "tests/multipart.rs"
 required-features = ["multipart"]
+
+# WASM streaming test (runs in a browser) + its native driver. The driver is
+# #[ignore]d and run explicitly; it starts an in-process h2 echo server and shells
+# out to `wasm-pack test`. See tests/wasm_stream_runner.rs.
+[[test]]
+name = "wasm_stream"
+path = "tests/wasm_stream.rs"
+required-features = ["stream"]
+
+[[test]]
+name = "wasm_stream_runner"
+path = "tests/wasm_stream_runner.rs"
+required-features = ["__rustls"]

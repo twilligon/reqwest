@@ -152,6 +152,120 @@ where
     .unwrap()
 }
 
+/// Like [`http`], but serves over HTTP/2 + TLS using the same self-signed cert
+/// as the h3 server (`tests/support/server.{cert,key}`).
+///
+/// Browsers refuse to stream a request body except over real HTTP/2-with-TLS, so
+/// the wasm streaming test (driven by `tests/wasm_stream_runner.rs`) needs this
+/// rather than the cleartext loopback `http` gives.
+#[cfg(feature = "__rustls")]
+pub fn https<F, Fut>(func: F) -> Server
+where
+    F: Fn(http::Request<hyper::body::Incoming>) -> Fut + Clone + Send + 'static,
+    Fut: Future<Output = http::Response<reqwest::Body>> + Send + 'static,
+{
+    use std::sync::Arc;
+
+    let test_name = thread::current().name().unwrap_or("<unknown>").to_string();
+    thread::spawn(move || {
+        let rt = runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("new rt");
+
+        // Same DER-encoded cert the h3 support server uses.
+        let cert = std::fs::read("tests/support/server.cert").unwrap().into();
+        let key = std::fs::read("tests/support/server.key")
+            .unwrap()
+            .try_into()
+            .unwrap();
+
+        #[cfg(feature = "__rustls-aws-lc-rs")]
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+        let mut tls = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .expect("server tls config");
+        tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
+
+        let listener = rt.block_on(async move {
+            tokio::net::TcpListener::bind(&std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+                .await
+                .unwrap()
+        });
+        let addr = listener.local_addr().unwrap();
+
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+        let (panic_tx, panic_rx) = std_mpsc::channel();
+        let (events_tx, events_rx) = std_mpsc::channel();
+        let tname = format!("test({test_name})-support-server");
+        thread::Builder::new()
+            .name(tname)
+            .spawn(move || {
+                rt.block_on(async move {
+                    let builder = hyper_util::server::conn::auto::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    );
+                    let mut tasks = tokio::task::JoinSet::new();
+                    let graceful = hyper_util::server::graceful::GracefulShutdown::new();
+
+                    loop {
+                        tokio::select! {
+                            _ = &mut shutdown_rx => {
+                                graceful.shutdown().await;
+                                break;
+                            }
+                            accepted = listener.accept() => {
+                                let (io, _) = accepted.expect("accepted");
+                                let acceptor = acceptor.clone();
+                                let func = func.clone();
+                                let builder = builder.clone();
+                                let events_tx = events_tx.clone();
+                                let watcher = graceful.watcher();
+
+                                tasks.spawn(async move {
+                                    let Ok(io) = acceptor.accept(io).await else {
+                                        return;
+                                    };
+                                    let svc = hyper::service::service_fn(move |req| {
+                                        let fut = func(req);
+                                        async move { Ok::<_, Infallible>(fut.await) }
+                                    });
+                                    let conn = builder.serve_connection_with_upgrades(
+                                        hyper_util::rt::TokioIo::new(io),
+                                        svc,
+                                    );
+                                    let _ = watcher.watch(conn).await;
+                                    let _ = events_tx.send(Event::ConnectionClosed);
+                                });
+                            }
+                        }
+                    }
+
+                    while let Some(result) = tasks.join_next().await {
+                        if let Err(e) = result {
+                            if e.is_panic() {
+                                std::panic::resume_unwind(e.into_panic());
+                            }
+                        }
+                    }
+                    let _ = panic_tx.send(());
+                });
+            })
+            .expect("thread spawn");
+        Server {
+            addr,
+            panic_rx,
+            events_rx,
+            shutdown_tx: Some(shutdown_tx),
+        }
+    })
+    .join()
+    .unwrap()
+}
+
 #[cfg(feature = "http3")]
 #[derive(Debug, Default)]
 pub struct Http3 {
