@@ -69,6 +69,12 @@ pub(crate) struct Streaming {
     readable: web_sys::ReadableStream,
 }
 
+pub(crate) enum Kind {
+    Bytes,
+    #[cfg(feature = "stream")]
+    Reader(BodyFuture),
+}
+
 impl Body {
     /// Returns a reference to the internal data of the `Body`.
     ///
@@ -146,13 +152,13 @@ impl Body {
         }
     }
 
-    pub(crate) fn into_future(self) -> Option<BodyFuture> {
+    pub(crate) fn into_kind(self) -> Kind {
         match self.inner {
-            Inner::Single(_) => None,
+            Inner::Single(_) => Kind::Bytes,
             #[cfg(feature = "multipart")]
-            Inner::MultipartForm(_) => None,
+            Inner::MultipartForm(_) => Kind::Bytes,
             #[cfg(feature = "stream")]
-            Inner::Streaming(streaming) => Some(streaming.write_fut),
+            Inner::Streaming(streaming) => Kind::Reader(streaming.write_fut),
         }
     }
 

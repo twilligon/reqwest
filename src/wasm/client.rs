@@ -13,6 +13,7 @@ use url::Url;
 use wasm_bindgen::prelude::{wasm_bindgen, UnwrapThrowExt as _};
 use wasm_bindgen::JsCast;
 
+use super::body::Kind;
 use super::{AbortGuard, Request, RequestBuilder, Response};
 use crate::IntoUrl;
 
@@ -269,17 +270,30 @@ async fn fetch(mut req: Request) -> crate::Result<Response> {
     }
 
     let body_fut = if let Some(body) = req.body_mut().take() {
-        if !body.is_empty() {
-            init.body(Some(body.to_js_value()?.as_ref()));
-            let fut = body.into_future();
-            if fut.is_some() {
-                js_sys::Reflect::set(&init, &"duplex".into(), &"half".into())
-                    .map_err(crate::error::wasm)
-                    .map_err(crate::error::builder)?;
-            }
-            fut
-        } else {
+        if body.is_empty() {
             None
+        } else {
+            let body_js = body.to_js_value()?;
+            match body.into_kind() {
+                Kind::Bytes => {
+                    init.body(Some(body_js.as_ref()));
+                    None
+                }
+                #[cfg(feature = "stream")]
+                Kind::Reader(write_fut) => {
+                    let readable: web_sys::ReadableStream = body_js.unchecked_into();
+                    if supports_request_streaming() {
+                        init.body(Some(readable.as_ref()));
+                        js_sys::Reflect::set(&init, &"duplex".into(), &"half".into())
+                            .map_err(crate::error::wasm)
+                            .map_err(crate::error::builder)?;
+                        Some(write_fut)
+                    } else {
+                        init.body(Some(buffer_stream(write_fut, &readable).await?.as_ref()));
+                        None
+                    }
+                }
+            }
         }
     } else {
         None
@@ -337,6 +351,105 @@ async fn fetch(mut req: Request) -> crate::Result<Response> {
     resp.body(js_resp)
         .map(|resp| Response::new(resp, url, abort))
         .map_err(crate::error::request)
+}
+
+/// Whether the current engine can send a streaming request body (detected once,
+/// then cached).
+///
+/// Chromium-based engines can (over HTTP/2 or HTTP/3, with `duplex: "half"`); on
+/// Firefox and Safari a `ReadableStream` body is instead silently stringified to
+/// `"[object ReadableStream]"`, so reqwest buffers such a body before sending.
+///
+/// This is a port of the Chrome team's reference feature detection: only an
+/// engine that supports request streams reads the `duplex` getter and leaves the
+/// body a stream (no auto `Content-Type`); others stringify it and add a
+/// `Content-Type: text/plain` header, which the check below notices.
+///
+/// ```js
+/// const supportsRequestStreams = (() => {
+///   let duplexAccessed = false;
+///
+///   const hasContentType = new Request('', {
+///     body: new ReadableStream(),
+///     method: 'POST',
+///     get duplex() {
+///       duplexAccessed = true;
+///       return 'half';
+///     },
+///   }).headers.has('Content-Type');
+///
+///   return duplexAccessed && !hasContentType;
+/// })();
+/// ```
+///
+/// <https://developer.chrome.com/docs/capabilities/web-apis/fetch-streaming-requests#feature-detection>
+///
+/// We replicate this through `js-sys` instead of shipping the JS verbatim via
+/// `#[wasm_bindgen(inline_js = …)]`, on purpose: an inline-JS snippet becomes a
+/// wasm-bindgen ES-module "snippet", which `--target no-modules` can't import —
+/// that alone would make reqwest fail to build for every no-modules consumer
+/// (classic ServiceWorkers, plain `<script>` loads). Orchestrating global
+/// builtins (`Object.defineProperty`, a `Closure`) from Rust ships no JS, so it
+/// builds for every wasm-bindgen target — and unlike `new Function`, it also
+/// works under a strict CSP.
+#[cfg(feature = "stream")]
+fn supports_request_streaming() -> bool {
+    fn probe() -> Result<bool, wasm_bindgen::JsValue> {
+        use wasm_bindgen::prelude::Closure;
+        use wasm_bindgen::{JsCast, JsValue};
+
+        // get duplex() { duplexAccessed = true; return 'half'; }
+        let duplex_accessed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let flag = duplex_accessed.clone();
+        let duplex_getter = Closure::wrap(Box::new(move || -> JsValue {
+            flag.set(true);
+            JsValue::from_str("half")
+        }) as Box<dyn FnMut() -> JsValue>);
+
+        // new Request('', { method: 'POST', body: new ReadableStream(), get duplex() {…} })
+        let init = js_sys::Object::new();
+        js_sys::Reflect::set(&init, &"method".into(), &"POST".into())?;
+        js_sys::Reflect::set(&init, &"body".into(), &web_sys::ReadableStream::new()?.into())?;
+        let descriptor = js_sys::Object::new();
+        js_sys::Reflect::set(&descriptor, &"get".into(), duplex_getter.as_ref())?;
+        js_sys::Object::define_property(&init, &"duplex".into(), &descriptor);
+
+        let has_content_type = web_sys::Request::new_with_str_and_init("", init.unchecked_ref())?
+            .headers()
+            .has("Content-Type")?;
+
+        // return duplexAccessed && !hasContentType;
+        Ok(duplex_accessed.get() && !has_content_type)
+    }
+    thread_local! {
+        static SUPPORTED: bool = probe().unwrap_or(false);
+    }
+    SUPPORTED.with(|supported| *supported)
+}
+
+#[cfg(feature = "stream")]
+async fn buffer_stream(
+    write_fut: super::body::BodyFuture,
+    readable: &web_sys::ReadableStream,
+) -> crate::Result<wasm_bindgen::JsValue> {
+    use wasm_bindgen_futures::JsFuture;
+    let resp = web_sys::Response::new_with_opt_readable_stream(Some(readable))
+        .map_err(crate::error::wasm)
+        .map_err(crate::error::builder)?;
+    let buffer = resp
+        .array_buffer()
+        .map_err(crate::error::wasm)
+        .map_err(crate::error::builder)?;
+    // Drive the user's stream into the writable side while the readable side is
+    // read into the ArrayBuffer; both must progress for either to finish.
+    let (write_res, buffer_res) =
+        futures_util::future::join(write_fut, JsFuture::from(buffer)).await;
+    write_res
+        .map_err(crate::error::wasm)
+        .map_err(crate::error::builder)?;
+    buffer_res
+        .map_err(crate::error::wasm)
+        .map_err(crate::error::builder)
 }
 
 // ===== impl ClientBuilder =====
